@@ -35,7 +35,7 @@ Extra tooling for qBittorrent — CLI utilities for managing torrents.
 - Never force-push ghstack branches
 
 
- `main`
+## Protect `main`
 
 - Require 1 approving review
 - Require linear history (no merge commits)
