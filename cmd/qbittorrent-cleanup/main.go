@@ -1,4 +1,5 @@
-// Package main provides a utility to manage errored torrents in qBittorrent.
+// Package main provides a utility to manage errored and missing-files
+// torrents in qBittorrent.
 package main
 
 import (
@@ -17,6 +18,11 @@ import (
 	"github.com/spf13/viper"
 )
 
+const (
+	jobDeleteMissingFiles = "delete-missing-files"
+	jobResumeErrored      = "resume-errored"
+)
+
 type Torrent struct {
 	Hash  string `json:"hash"`
 	State string `json:"state"`
@@ -27,6 +33,8 @@ type QBitClient struct {
 	BaseURL string
 	HTTP    *http.Client
 }
+
+var allJobs = []string{jobDeleteMissingFiles, jobResumeErrored}
 
 var rootCmd = &cobra.Command{
 	Use:   "qbittorrent-cleanup",
@@ -40,6 +48,7 @@ func init() {
 	f.String("user", "", "qBittorrent username")
 	f.String("password", "", "qBittorrent password")
 	f.Duration("timeout", 30*time.Second, "API request timeout")
+	f.StringSlice("job", nil, fmt.Sprintf("Jobs to run (repeatable: --job=%s --job=%s); defaults to both", jobDeleteMissingFiles, jobResumeErrored))
 
 	cobra.OnInitialize(func() {
 		viper.SetEnvPrefix("QBT")
@@ -84,13 +93,12 @@ func (c *QBitClient) Login(ctx context.Context, user, pass string) error {
 	return nil
 }
 
-func (c *QBitClient) GetErroredTorrents(ctx context.Context) ([]Torrent, error) {
-	req, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodGet,
-		c.BaseURL+"/api/v2/torrents/info?filter=error",
-		http.NoBody,
-	)
+func (c *QBitClient) GetTorrents(ctx context.Context, filter string) ([]Torrent, error) {
+	u := c.BaseURL + "/api/v2/torrents/info"
+	if filter != "" {
+		u += "?filter=" + url.QueryEscape(filter)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, http.NoBody)
 	if err != nil {
 		return nil, err
 	}
@@ -106,6 +114,28 @@ func (c *QBitClient) GetErroredTorrents(ctx context.Context) ([]Torrent, error) 
 		return nil, err
 	}
 	return torrents, nil
+}
+
+// GetErroredTorrents returns torrents in the errored state category.
+func (c *QBitClient) GetErroredTorrents(ctx context.Context) ([]Torrent, error) {
+	return c.GetTorrents(ctx, "errored")
+}
+
+// GetMissingFilesTorrents fetches all torrents and filters for those in the
+// missingFiles state. This catches torrents that some qBittorrent versions
+// exclude from the errored filter.
+func (c *QBitClient) GetMissingFilesTorrents(ctx context.Context) ([]Torrent, error) {
+	torrents, err := c.GetTorrents(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	var missing []Torrent
+	for _, t := range torrents {
+		if t.State == "missingFiles" {
+			missing = append(missing, t)
+		}
+	}
+	return missing, nil
 }
 
 func (c *QBitClient) DeleteTorrents(ctx context.Context, hashes []string) error {
@@ -161,9 +191,15 @@ func runCleanup(_ *cobra.Command, _ []string) {
 	user := viper.GetString("user")
 	pass := viper.GetString("password")
 	timeout := viper.GetDuration("timeout")
+	jobs := viper.GetStringSlice("job")
 
 	if apiURL == "" || user == "" || pass == "" {
 		log.Fatal("Error: Missing required configuration (URL, User, or Password)")
+	}
+
+	// Default: run all jobs when none explicitly selected.
+	if len(jobs) == 0 {
+		jobs = allJobs
 	}
 
 	client, err := NewClient(apiURL)
@@ -179,41 +215,71 @@ func runCleanup(_ *cobra.Command, _ []string) {
 		return
 	}
 
+	for _, job := range jobs {
+		switch job {
+		case jobDeleteMissingFiles:
+			deleteMissingFiles(ctx, client)
+		case jobResumeErrored:
+			resumeErrored(ctx, client)
+		default:
+			fmt.Printf("Unknown job: %s\n", job)
+		}
+	}
+}
+
+func deleteMissingFiles(ctx context.Context, client *QBitClient) {
+	torrents, err := client.GetMissingFilesTorrents(ctx)
+	if err != nil {
+		fmt.Printf("Fetch error: %v\n", err)
+		return
+	}
+
+	if len(torrents) == 0 {
+		fmt.Println("No missing-files torrents found.")
+		return
+	}
+
+	hashes := make([]string, len(torrents))
+	for i, t := range torrents {
+		fmt.Printf("Found missing files for: %s\n", t.Name)
+		hashes[i] = t.Hash
+	}
+
+	fmt.Printf("Deleting %d torrents with missing files...\n", len(hashes))
+	if err := client.DeleteTorrents(ctx, hashes); err != nil {
+		log.Printf("Delete error: %v", err)
+		return
+	}
+	fmt.Println("Delete-missing-files done.")
+}
+
+func resumeErrored(ctx context.Context, client *QBitClient) {
 	torrents, err := client.GetErroredTorrents(ctx)
 	if err != nil {
 		fmt.Printf("Fetch error: %v\n", err)
 		return
 	}
 
-	var toDelete []string
 	var toResume []string
 
 	for _, t := range torrents {
 		if t.State == "missingFiles" {
-			fmt.Printf("Found missing files for: %s\n", t.Name)
-			toDelete = append(toDelete, t.Hash)
-		} else {
-			toResume = append(toResume, t.Hash)
+			// Handled by delete-missing-files job; skip here.
+			continue
 		}
+		fmt.Printf("Resuming errored torrent: %s\n", t.Name)
+		toResume = append(toResume, t.Hash)
 	}
 
-	if len(toDelete) > 0 {
-		fmt.Printf("Deleting %d torrents with missing files...\n", len(toDelete))
-		if err := client.DeleteTorrents(ctx, toDelete); err != nil {
-			log.Printf("Delete error: %v", err)
-		}
+	if len(toResume) == 0 {
+		fmt.Println("No recoverable errored torrents found.")
+		return
 	}
 
-	if len(toResume) > 0 {
-		fmt.Printf("Resuming %d recoverable torrents...\n", len(toResume))
-		if err := client.Resume(ctx, toResume); err != nil {
-			log.Printf("Resume error: %v", err)
-		}
+	fmt.Printf("Resuming %d recoverable torrents...\n", len(toResume))
+	if err := client.Resume(ctx, toResume); err != nil {
+		log.Printf("Resume error: %v", err)
+		return
 	}
-
-	if len(toDelete) == 0 && len(toResume) == 0 {
-		fmt.Println("No action needed.")
-	} else {
-		fmt.Println("Cleanup complete.")
-	}
+	fmt.Println("Resume-errored done.")
 }
